@@ -2151,6 +2151,29 @@
       "input_style": "canonical"
     },
     {
+      "id": "add_wall_lj93",
+      "description": "LAMMPS-compatible LJ 9-3 lower and upper planar walls",
+      "suites": [
+        "special",
+        "first_step_init",
+        "full"
+      ],
+      "fixture": "ilp_tersoff_graphene",
+      "input": "package:cases/special/add_wall_lj93.in",
+      "covers": [
+        "ensemble:nve",
+        "potential:tersoff-ilp",
+        "external-force:add_wall"
+      ],
+      "expect": "success",
+      "outputs": [
+        "thermo.out",
+        "final.xyz",
+        "restart.xyz"
+      ],
+      "input_style": "canonical"
+    },
+    {
       "id": "wall_mirror",
       "description": "Moving mirror wall with explicit velocity",
       "suites": [
