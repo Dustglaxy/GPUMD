@@ -311,7 +311,7 @@ void Measure::pre_run(
       printf("    Please set the action name you developed.\n");
       exit(1);
     }
-    // dump_xyz, dump_netcdf, compute_chunk, add_force, add_spring, and add_efield are allowed
+    // dump_xyz, dump_netcdf, compute_chunk, add_force, add_wall, add_spring, and add_efield are allowed
     // to be called multiple times; others are not
     if (
       action->action_name != "dump_xyz" && action->action_name != "dump_netcdf" &&
