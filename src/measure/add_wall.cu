@@ -89,10 +89,10 @@ static __global__ void gpu_add_lj93_wall(
     g_virial[atom_id] += force_magnitude * delta;
   } else if (dimension == 1) {
     g_fy[atom_id] += force_component;
-    g_virial[atom_id + 4 * number_of_atoms] += force_magnitude * delta;
+    g_virial[atom_id + number_of_atoms] += force_magnitude * delta;
   } else {
     g_fz[atom_id] += force_component;
-    g_virial[atom_id + 8 * number_of_atoms] += force_magnitude * delta;
+    g_virial[atom_id + 2 * number_of_atoms] += force_magnitude * delta;
   }
   g_potential[atom_id] += energy;
 }
