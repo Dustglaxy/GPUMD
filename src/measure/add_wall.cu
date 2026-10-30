@@ -86,7 +86,8 @@ static __global__ void gpu_add_lj93_wall(
 
   if (dimension == 0) {
     g_fx[atom_id] += force_component;
-    // GPUMD stores virial components as xx, yy, zz, xy, xz, yz, yx, zx, zy.\n    g_virial[atom_id] += force_magnitude * delta;
+    // GPUMD stores virial components as xx, yy, zz, xy, xz, yz, yx, zx, zy.
+    g_virial[atom_id] += force_magnitude * delta;
   } else if (dimension == 1) {
     g_fy[atom_id] += force_component;
     g_virial[atom_id + number_of_atoms] += force_magnitude * delta;
