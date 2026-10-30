@@ -86,7 +86,7 @@ static __global__ void gpu_add_lj93_wall(
 
   if (dimension == 0) {
     g_fx[atom_id] += force_component;
-    g_virial[atom_id] += force_magnitude * delta;
+    // GPUMD stores virial components as xx, yy, zz, xy, xz, yz, yx, zx, zy.\n    g_virial[atom_id] += force_magnitude * delta;
   } else if (dimension == 1) {
     g_fy[atom_id] += force_component;
     g_virial[atom_id + number_of_atoms] += force_magnitude * delta;
@@ -122,6 +122,7 @@ Add_Wall::Add_Wall(
     PRINT_INPUT_ERROR("add_wall: invalid group id.");
   }
 
+  bool face_defined[6] = {false, false, false, false, false, false};
   for (size_t i = 4; i < tokens.size(); i += 5) {
     Wall wall;
     const std::string& face = tokens[i];
@@ -146,6 +147,12 @@ Add_Wall::Add_Wall(
     } else {
       PRINT_INPUT_ERROR("add_wall: face must be xlo, xhi, ylo, yhi, zlo, or zhi.");
     }
+
+    const int face_id = 2 * wall.dimension + (wall.side > 0 ? 1 : 0);
+    if (face_defined[face_id]) {
+      PRINT_INPUT_ERROR("add_wall: the same face cannot be defined twice in one command.");
+    }
+    face_defined[face_id] = true;
 
     if (tokens[i + 1] == "EDGE") {
       wall.use_edge = true;
