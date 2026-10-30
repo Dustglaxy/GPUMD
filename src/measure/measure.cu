@@ -21,6 +21,7 @@ The driver class dealing with measurement.
 #include "active.cuh"
 #include "add_efield.cuh"
 #include "add_force.cuh"
+#include "add_wall.cuh"
 #include "add_random_force.cuh"
 #include "add_spring.cuh"
 #include "adf.cuh"
@@ -263,6 +264,10 @@ bool Measure::parse_action(
     std::unique_ptr<Action> action;
     action.reset(new Add_Force(tokens, group));
     actions_.emplace_back(std::move(action));
+  } else if (tokens[0] == "add_wall") {
+    std::unique_ptr<Action> action;
+    action.reset(new Add_Wall(tokens, group));
+    actions_.emplace_back(std::move(action));
   } else if (tokens[0] == "add_spring") {
     std::unique_ptr<Action> action;
     action.reset(new Add_Spring(tokens, group, atom));
@@ -311,7 +316,8 @@ void Measure::pre_run(
     if (
       action->action_name != "dump_xyz" && action->action_name != "dump_netcdf" &&
       action->action_name != "compute_chunk" &&
-      action->action_name != "add_force" && action->action_name != "add_spring" &&
+      action->action_name != "add_force" && action->action_name != "add_wall" &&
+      action->action_name != "add_spring" &&
       action->action_name != "add_efield") {
       for (auto& action_name : action_names) {
         if (action_name == action->action_name) {

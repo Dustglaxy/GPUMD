@@ -97,6 +97,10 @@ Simulation setup
      - Add external forces to selected atoms
      - No
      - No
+   * - :ref:`add_wall <kw_add_wall>`
+     - Add planar Lennard-Jones 9-3 wall potentials
+     - No
+     - No
    * - :ref:`add_efield <kw_add_efield>`
      - Apply an electric field to selected atoms
      - No
