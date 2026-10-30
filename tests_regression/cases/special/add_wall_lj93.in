@@ -1,0 +1,10 @@
+replicate 7 5 1
+potential ilp_tersoff.txt tersoff_params.txt
+velocity 300 seed 20261030
+time_step 1e-20
+ensemble nve
+add_wall lj93 0 0 zlo 6.5 0.1 3.0 10.0 zhi 17.0 0.1 3.0 10.0
+dump_thermo 1
+dump_xyz 1 final.xyz precision double force potential virial
+dump_restart 1
+run 1

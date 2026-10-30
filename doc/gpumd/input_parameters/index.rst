@@ -37,6 +37,7 @@ Below you can find a listing of keywords for the ``run.in`` input file.
    ensemble_msst
    ensemble_nphug
    add_force
+   add_wall
    add_efield
    add_spring
    deposit
