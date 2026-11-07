@@ -156,21 +156,15 @@ relaxing tolerances.
 
 ## Reproduction commands and artifacts
 
-The submitted runtime scripts and logs are retained under the H100 test root.
-Key commands, from that directory, were:
-
-```bash
-sbatch latest_e5_energy_smoke.slurm
-sbatch latest_e5_temperature_tests.slurm
-sbatch latest_e5_plumed_tests.slurm
-sbatch latest_e5_selection_tests.slurm
-sbatch final_acceptance.slurm
-sbatch normal_run_compare.slurm
-sbatch run_tests_pytest_final.slurm
-```
+The original H100 validation used temporary SLURM jobs and external
+artifacts. Those cluster-specific job scripts were deliberately removed from
+this repository during cleanup; the commands are not reproducible as-is.
+The validated results below are historical and are not a claim that the
+cleaned branch has been re-tested.
 
 PLUMED, selection/scheduling, negative/path/lifecycle, normal-run comparison,
-energy, temperature, and full `tests_pytest` runs all completed successfully.
+energy, temperature, and full `tests_pytest` runs completed successfully
+before the cleanup.
 Outputs and raw logs are in the corresponding `energy_smoke`,
 `temperature_final`, `plumed_final`, `selection`, `final_acceptance`, and
 `normal_run_compare` subdirectories.
@@ -179,7 +173,7 @@ Outputs and raw logs are in the corresponding `energy_smoke`,
 
 - Production fix: `e5f1b4f6dc8072a29aaa13946755d07a6fd9b383` —
   `Reject rerun dump paths that alias input`.
-- This report and reproducible final acceptance drivers are committed on
+- This report and historical validation records were committed on
   `feature/rerun` in the validation commit immediately following the fix
   commit; the final validation commit hash is recorded by repository HEAD.
 - Working tree is clean after the validation commit.
