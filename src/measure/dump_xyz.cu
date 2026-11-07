@@ -28,6 +28,11 @@ Dump per-atom data to user-specified file(s) in the extended XYZ format
 #include "utilities/gpu_vector.cuh"
 #include "utilities/read_file.cuh"
 #include <cstring>
+#include <stdlib.h>
+#include <sys/stat.h>
+#ifndef _WIN32
+#include <limits.h>
+#endif
 
 static __global__ void gpu_sum(const int N, const double* g_data, double* g_data_sum)
 {
@@ -67,6 +72,60 @@ Dump_XYZ::Dump_XYZ(
   }
 
   action_name = "dump_xyz";
+}
+
+void Dump_XYZ::validate_rerun(bool has_potential) const
+{
+  if (!has_potential &&
+      (quantities.has_force_ || quantities.has_potential_ ||
+       quantities.has_virial_ || quantities.has_bec_ || has_mforce_)) {
+    PRINT_INPUT_ERROR("rerun dump_xyz force/potential/virial/bec/mforce requires a potential.");
+  }
+  if (quantities.has_unwrapped_position_) {
+    PRINT_INPUT_ERROR(
+      "rerun dump_xyz unwrapped_position requires trajectory image flags (not yet supported).");
+  }
+}
+
+bool Dump_XYZ::rerun_requires_velocity() const
+{
+  return quantities.has_velocity_;
+}
+
+bool Dump_XYZ::rerun_overwrites_input(const std::string& path) const
+{
+  if (separated_ != 0 || split_frames_ > 0) return false;
+  return rerun_output_overwrites_input(filename_, path);
+}
+
+bool Dump_XYZ::rerun_output_overwrites_input(
+  const std::string& output_path, const std::string& input_path) const
+{
+  if (output_path == input_path) return true;
+
+#ifdef _WIN32
+  char canonical_output_path[_MAX_PATH];
+  char canonical_input_path[_MAX_PATH];
+  if (_fullpath(canonical_output_path, output_path.c_str(), _MAX_PATH) == nullptr ||
+      _fullpath(canonical_input_path, input_path.c_str(), _MAX_PATH) == nullptr) {
+    return false;
+  }
+  if (_stricmp(canonical_output_path, canonical_input_path) == 0) return true;
+#else
+  char canonical_output_path[PATH_MAX];
+  char canonical_input_path[PATH_MAX];
+  if (realpath(output_path.c_str(), canonical_output_path) != nullptr &&
+      realpath(input_path.c_str(), canonical_input_path) != nullptr &&
+      std::strcmp(canonical_output_path, canonical_input_path) == 0) {
+    return true;
+  }
+#endif
+
+  struct stat output_info;
+  struct stat input_info;
+  return stat(output_path.c_str(), &output_info) == 0 &&
+    stat(input_path.c_str(), &input_info) == 0 &&
+    output_info.st_dev == input_info.st_dev && output_info.st_ino == input_info.st_ino;
 }
 
 void Dump_XYZ::parse(
@@ -192,6 +251,10 @@ void Dump_XYZ::pre_run(
     splitter_.reset(filename_, split_frames_);
     fid_ = nullptr;
   } else if (separated_ == 0) {
+    if (!rerun_input_path_.empty() &&
+        rerun_output_overwrites_input(filename_, rerun_input_path_)) {
+      PRINT_INPUT_ERROR("rerun dump_xyz output must not overwrite the input trajectory.");
+    }
     fid_ = my_fopen(filename_.c_str(), "a");
   }
 
@@ -243,6 +306,7 @@ void Dump_XYZ::print_tensor(const char* name, const double* tensor)
 }
 
 void Dump_XYZ::output_line2(
+  const long long timestep,
   const double time,
   const Box& box,
   std::vector<Group>& groups,
@@ -252,6 +316,8 @@ void Dump_XYZ::output_line2(
 {
   // time
   fprintf(fid_, "Time=%.8f", time * TIME_UNIT_CONVERSION); // output time is in units of fs
+  // Exact integer step avoids loss of precision when rerunning long trajectories.
+  fprintf(fid_, " Step=%lld", timestep);
 
   // PBC
   fprintf(
@@ -410,12 +476,20 @@ void Dump_XYZ::end_of_step(
 
   if (separated_) {
     std::string filename = filename_ + std::to_string(step + 1);
+    if (!rerun_input_path_.empty() &&
+        rerun_output_overwrites_input(filename, rerun_input_path_)) {
+      PRINT_INPUT_ERROR("rerun dump_xyz output must not overwrite the input trajectory.");
+    }
     fid_ = my_fopen(filename.data(), "w");
   } else if (split_frames_ > 0 && splitter_.needs_new_file()) {
     if (fid_ != nullptr) {
       fclose(fid_);
     }
     const std::string filename = splitter_.next_filename();
+    if (!rerun_input_path_.empty() &&
+        rerun_output_overwrites_input(filename, rerun_input_path_)) {
+      PRINT_INPUT_ERROR("rerun dump_xyz output must not overwrite the input trajectory.");
+    }
     fid_ = my_fopen(filename.c_str(), "w");
   }
 
@@ -423,7 +497,8 @@ void Dump_XYZ::end_of_step(
   fprintf(fid_, "%d\n", number_of_atoms_to_dump);
 
   // line 2
-  output_line2(global_time, box, groups, atom.cpu_atom_symbol, atom.virial_per_atom, thermo);
+  const long long frame_step = header_step_ >= 0 ? header_step_ : static_cast<long long>(step) + 1;
+  output_line2(frame_step, global_time, box, groups, atom.cpu_atom_symbol, atom.virial_per_atom, thermo);
 
   // other lines
   for (int n = 0; n < number_of_atoms_to_dump; n++) {

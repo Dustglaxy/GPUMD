@@ -67,9 +67,130 @@ The driver class dealing with measurement.
 #include "utilities/error.cuh"
 #include "utilities/read_file.cuh"
 #include <iostream>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
+
+void Measure::set_xyz_header_step(long long timestep)
+{
+  for (auto& action : actions_) {
+    if (action->action_name == "dump_xyz") {
+      static_cast<Dump_XYZ*>(action.get())->set_header_step(timestep);
+    }
+  }
+}
+
+bool Measure::rerun_needs_velocity() const
+{
+  if (rerun_needs_thermo()) return true;
+  for (const auto& action : actions_) {
+    if (action->action_name == "dump_xyz" &&
+        static_cast<const Dump_XYZ*>(action.get())->rerun_requires_velocity())
+      return true;
+  }
+  return false;
+}
+
+bool Measure::rerun_output_conflicts(const std::string& trajectory) const
+{
+  for (const auto& action : actions_) {
+    if (action->action_name == "dump_xyz" &&
+        static_cast<const Dump_XYZ*>(action.get())->rerun_overwrites_input(trajectory))
+      return true;
+  }
+  return false;
+}
+
+bool Measure::rerun_needs_thermo() const
+{
+  for (const auto& action : actions_) {
+    if (action->action_name == "dump_thermo") return true;
+  }
+  return false;
+}
+
+void Measure::validate_rerun(bool has_potential) const
+{
+  for (const auto& action : actions_) {
+    const std::string& name = action->action_name;
+    if (name == "plumed") continue;
+    if (name == "dump_xyz") {
+      static_cast<const Dump_XYZ*>(action.get())->validate_rerun(has_potential);
+      continue;
+    }
+    if (name == "dump_thermo" && has_potential) continue;
+    PRINT_INPUT_ERROR(
+      "rerun currently supports only plumed, dump_xyz and "
+      "dump_thermo (the latter requires a potential and trajectory velocities).");
+  }
+}
+
+void Measure::pre_rerun(
+  const double time_step, const double temperature, Integrate& integrate, std::vector<Group>& group,
+  Atom& atom, Box& box, Force& force, const std::string& trajectory)
+{
+  for (auto& action : actions_) {
+    if (action->action_name == "dump_xyz") {
+      static_cast<Dump_XYZ*>(action.get())->set_rerun_input_path(trajectory);
+    }
+#ifdef USE_PLUMED
+    if (action->action_name == "plumed") {
+      static_cast<PLUMED*>(action.get())->pre_rerun(time_step, temperature, atom);
+      continue;
+    }
+#endif
+    action->pre_run(0, time_step, integrate, group, atom, box, force);
+  }
+}
+
+void Measure::rerun_frame(
+  const long long timestep, const double time_natural,
+  Integrate& integrate, std::vector<Group>& group, Atom& atom,
+  Box& box, Force& force, GPU_Vector<double>& thermo)
+{
+  // Keep a consistent meaning for interval: original MD timestep, not
+  // the count of snapshots read by the rerun loop.
+  if (timestep > static_cast<long long>(std::numeric_limits<int>::max())) {
+    PRINT_INPUT_ERROR("rerun timestep exceeds supported Measure interval range.");
+  }
+  set_xyz_header_step(timestep);
+  // CVs are evaluated before dump output so their PRINT outputs follow the
+  // original trajectory time. Normal MD integration hooks are not called.
+#ifdef USE_PLUMED
+  for (auto& action : actions_) {
+    if (action->action_name == "plumed") {
+      static_cast<PLUMED*>(action.get())->rerun_frame(timestep, box, atom);
+    }
+  }
+#endif
+  for (auto& action : actions_) {
+    if (action->action_name == "plumed") continue;
+    if (action->action_name == "dump_thermo") {
+      static_cast<Dump_Thermo*>(action.get())->rerun_frame(timestep, thermo, atom.number_of_atoms, box);
+      continue;
+    }
+    // end_of_step is zero-indexed in GPUMD, hence timestep-1 here.
+    action->end_of_step(
+      0, static_cast<int>(timestep) - 1, -1, -1, time_natural, 0.0,
+      integrate, box, group, thermo, atom, force);
+  }
+}
+
+void Measure::post_rerun(
+  const double time_step, Integrate& integrate, Atom& atom, Box& box)
+{
+  for (auto& action : actions_) {
+#ifdef USE_PLUMED
+    if (action->action_name == "plumed") {
+      static_cast<PLUMED*>(action.get())->post_rerun();
+      continue;
+    }
+#endif
+    action->post_run(atom, box, integrate, 0, time_step, 0.0);
+  }
+  actions_.clear();
+}
 
 bool Measure::parse_action(
   const std::vector<std::string>& tokens,
@@ -93,7 +214,7 @@ bool Measure::parse_action(
 #ifdef USE_NETCDF
     std::unique_ptr<Action> action;
     action.reset(new DUMP_NETCDF(
-      tokens, group, atom, is_nep_charge_potential(first_potential_filename)));
+      tokens, group, atom, (!first_potential_filename.empty() && is_nep_charge_potential(first_potential_filename))));
     actions_.emplace_back(std::move(action));
 #else
     PRINT_INPUT_ERROR("dump_netcdf is available only when USE_NETCDF flag is set.\n");
@@ -129,7 +250,7 @@ bool Measure::parse_action(
   } else if (tokens[0] == "dump_xyz") {
     std::unique_ptr<Action> action;
     action.reset(new Dump_XYZ(
-      tokens, group, atom, is_nep_charge_potential(first_potential_filename)));
+      tokens, group, atom, (!first_potential_filename.empty() && is_nep_charge_potential(first_potential_filename))));
     actions_.emplace_back(std::move(action));
   } else if (tokens[0] == "dump_cg") {
     std::unique_ptr<Action> action;
@@ -198,7 +319,7 @@ bool Measure::parse_action(
   } else if (tokens[0] == "compute_dpdt") {
     std::unique_ptr<Action> action;
     action.reset(new Compute_dpdt(
-      tokens, is_nep_charge_potential(first_potential_filename)));
+      tokens, (!first_potential_filename.empty() && is_nep_charge_potential(first_potential_filename))));
     actions_.emplace_back(std::move(action));
   } else if (tokens[0] == "compute_es") {
     std::unique_ptr<Action> action;
@@ -274,7 +395,7 @@ bool Measure::parse_action(
   } else if (tokens[0] == "add_efield") {
     std::unique_ptr<Action> action;
     action.reset(new Add_Efield(
-      tokens, group, is_nep_charge_potential(first_potential_filename)));
+      tokens, group, (!first_potential_filename.empty() && is_nep_charge_potential(first_potential_filename))));
     actions_.emplace_back(std::move(action));
   } else if (tokens[0] == "mc") {
     std::unique_ptr<Action> action;
