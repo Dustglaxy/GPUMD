@@ -20,6 +20,7 @@ Interface to the PLUMED plugin: https://www.plumed.org
 #ifdef USE_PLUMED
 
 #include "plumed.cuh"
+#include <limits>
 #include "utilities/common.cuh"
 #include "utilities/error.cuh"
 #include "utilities/gpu_macro.cuh"
@@ -152,7 +153,39 @@ void PLUMED::init(const double ts, const double T)
   plumed_cmd(plumed_main, "init", NULL);
 }
 
-void PLUMED::calculate(int plumed_step, Box& box, Atom& atom)
+void PLUMED::pre_rerun(const double ts, const double temperature, Atom& atom)
+{
+  n_atom = atom.number_of_atoms;
+  cpu_b_vector.resize(9);
+  cpu_v_vector.resize(9);
+  cpu_m_vector.resize(3 * n_atom);
+  cpu_f_vector.resize(3 * n_atom);
+  cpu_q_vector.resize(3 * n_atom);
+  memcpy(cpu_m_vector.data(), atom.cpu_mass.data(), n_atom * sizeof(double));
+  // Use the normal PLUMED initialization; the caller supplies the replay
+  // temperature when a physical simulation temperature was specified.
+  init(ts, temperature);
+}
+
+void PLUMED::rerun_frame(const long long timestep, Box& box, Atom& atom)
+{
+  if (timestep < 0 || timestep > std::numeric_limits<int>::max()) {
+    PRINT_INPUT_ERROR("PLUMED rerun timestep exceeds supported integer range.");
+  }
+  if (timestep % interval != 0) return;
+  step = static_cast<int>(timestep);
+  calculate(step, box, atom, false);
+}
+
+void PLUMED::post_rerun()
+{
+  if (use_plumed == 1) {
+    use_plumed = 0;
+    plumed_finalize(plumed_main);
+  }
+}
+
+void PLUMED::calculate(int plumed_step, Box& box, Atom& atom, bool apply_bias)
 {
   atom.force_per_atom.copy_to_host(cpu_f_vector.data());
   atom.position_per_atom.copy_to_host(cpu_q_vector.data());
@@ -185,6 +218,7 @@ void PLUMED::calculate(int plumed_step, Box& box, Atom& atom)
   plumed_cmd(plumed_main, "performCalc", NULL);
   plumed_cmd(plumed_main, "getBias", &bias_energy);
 
+  if (apply_bias) {
   atom.force_per_atom.copy_from_host(cpu_f_vector.data());
 
   // PLUMED and GPUMD use opposite virial sign conventions. Distribute the
@@ -212,6 +246,8 @@ void PLUMED::calculate(int plumed_step, Box& box, Atom& atom)
     atom.virial_per_atom.data() + n_atom * 7,
     atom.virial_per_atom.data() + n_atom * 8);
   GPU_CHECK_KERNEL
+  }
+
 }
 
 void PLUMED::setup_force(

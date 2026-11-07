@@ -33,6 +33,15 @@ public:
     Atom& atom,
     bool is_nep_charge);
   void parse(const std::vector<std::string>& tokens, const std::vector<Group>& groups);
+  // Replay checks reuse the existing XYZ output implementation.
+  void validate_rerun(bool has_potential) const;
+  bool rerun_requires_velocity() const;
+  bool rerun_overwrites_input(const std::string& path) const;
+  bool rerun_output_overwrites_input(
+    const std::string& output_path, const std::string& input_path) const;
+  void set_rerun_input_path(const std::string& path) { rerun_input_path_ = path; }
+  void set_header_step(long long timestep) { header_step_ = timestep; }
+
   virtual void pre_run(
     const int number_of_steps,
     const double time_step,
@@ -69,6 +78,7 @@ private:
   int grouping_method_ = -1;
   int group_id_ = -1;
   int dump_interval_ = 1;
+  long long header_step_ = -1; // exact cumulative MD step or replay step
   int precision_ = 1; // 1 = single precision, 2 = double
   DumpQuantities quantities;
   bool has_spin_ = false;
@@ -77,6 +87,7 @@ private:
   int split_frames_ = 0;
   XYZFrameSplitter splitter_;
   std::string filename_;
+  std::string rerun_input_path_;
   std::string fmt_;
   FILE* fid_ = nullptr;
 
@@ -93,6 +104,7 @@ private:
   void print_tensor(const char* name, const double* tensor);
 
   void output_line2(
+    const long long timestep,
     const double time,
     const Box& box,
     std::vector<Group>& group,

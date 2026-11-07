@@ -21,12 +21,14 @@ Run simulation according to the inputs in the run.in file.
 #include "force/force.cuh"
 #include "integrate/ensemble.cuh"
 #include "integrate/integrate.cuh"
+#include "integrate/thermo.cuh"
 #include "measure/measure.cuh"
 #include "minimize/minimize.cuh"
 #include "model/box.cuh"
 #include "model/read_xyz.cuh"
 #include "phonon/hessian.cuh"
 #include "replicate.cuh"
+#include "rerun_reader.hpp"
 #include "run.cuh"
 #include "utilities/error.cuh"
 #include "utilities/compact_nep.cuh"
@@ -35,6 +37,12 @@ Run simulation according to the inputs in the run.in file.
 #include "utilities/run_input.cuh"
 #include "velocity.cuh"
 #include <chrono>
+#include <algorithm>
+#include <fstream>
+#include <limits>
+#include <memory>
+#include <numeric>
+#include <stdexcept>
 
 static __global__ void gpu_find_largest_v2(
   int N, int number_of_rounds, double* g_vx, double* g_vy, double* g_vz, double* g_v2_max)
@@ -128,6 +136,10 @@ Run::Run(const RunInput& run_input)
   print_line_2();
 
   has_replicate_ = parse_initial_replicate(run_input, replicate_size_);
+
+  if (get_first_potential_filename(run_input).empty()) {
+    PRINT_INPUT_ERROR("A potential is required in run.in, including for rerun.");
+  }
 
   initialize_position(
     run_input,
@@ -241,6 +253,7 @@ void Run::perform_a_run(const int number_of_steps)
     calculate_time_step(
       max_distance_per_step, atom.velocity_per_atom, initial_time_step, time_step);
     global_time += time_step;
+    ++global_md_step;
 
     integrate.compute1(time_step, step, number_of_steps, group, box, atom, thermo);
 
@@ -257,6 +270,7 @@ void Run::perform_a_run(const int number_of_steps)
     integrate.compute2(time_step, step, number_of_steps, group, box, atom, thermo, force);
     atom.update_unwrapped_position(box);
 
+    measure.set_xyz_header_step(global_md_step);
     measure.end_of_step(
       number_of_steps,
       step,
@@ -302,7 +316,6 @@ void Run::parse_one_keyword(
   if (tokens[0] == "replicate") {
     PRINT_INPUT_ERROR("replicate must be the first effective command.");
   }
-
   const int num_param = tokens.size();
   const int max_num_param = 32;
   if (num_param > max_num_param)
@@ -314,6 +327,7 @@ void Run::parse_one_keyword(
 
   if (tokens[0] == "potential") {
     force.parse_potential(tokens, box, atom, run_input);
+    has_potential_for_rerun_ = true;
   } else if (tokens[0] == "minimize") {
     Minimize minimize;
     minimize.parse_minimize(
@@ -365,6 +379,8 @@ void Run::parse_one_keyword(
     has_seen_dftd3_command = true;
   } else if (tokens[0] == "run") {
     parse_run(tokens);
+  } else if (tokens[0] == "rerun") {
+    parse_rerun(tokens);
   } else if (!measure.parse_action(
                tokens,
                number_of_types,
@@ -376,6 +392,219 @@ void Run::parse_one_keyword(
                first_potential_filename_)) {
     PRINT_KEYWORD_ERROR(tokens[0].c_str());
   }
+}
+
+
+void Run::parse_rerun(const std::vector<std::string>& tokens)
+{
+  // Pseudo-run: trajectories replace integration as the source of configurations.
+  // A potential must already have been loaded, even for PLUMED-only analysis.
+  // All analysis/output is dispatched by Measure; rerun never creates a data file.
+  if (!has_potential_for_rerun_) {
+    PRINT_INPUT_ERROR("A potential must be specified before rerun.");
+  }
+  if (tokens.size() < 2) {
+    PRINT_INPUT_ERROR("rerun trajectory.xyz [first N] [last N] [every N] [skip N]");
+  }
+  // Replay reads any configured temperature from the ordinary GPUMD
+  // ensemble command. No separate temperature option is introduced.
+  const bool has_ensemble_for_rerun = integrate.has_ensemble();
+  const double simulation_temperature =
+    has_ensemble_for_rerun ? integrate.get_rerun_temperature() : 0.0;
+
+  gpumd_rerun::Selection selection;
+  // The first version accepts exactly one trajectory, tokens[1].
+  // Any additional positional filename is rejected as an unknown keyword.
+  for (size_t i = 2; i < tokens.size(); i += 2) {
+    if (i + 1 >= tokens.size()) {
+      PRINT_INPUT_ERROR("rerun requires a value after each keyword.");
+    }
+    long long value = 0;
+    try {
+      size_t used = 0;
+      value = std::stoll(tokens[i + 1], &used);
+      if (used != tokens[i + 1].size()) throw std::invalid_argument("trailing characters");
+    } catch (const std::exception&) {
+      PRINT_INPUT_ERROR("rerun first/last/every/skip require integer values.");
+    }
+    if (tokens[i] == "first") selection.first = value;
+    else if (tokens[i] == "last") selection.last = value;
+    else if (tokens[i] == "every") selection.every = value;
+    else if (tokens[i] == "skip") selection.skip = value;
+    else PRINT_INPUT_ERROR("unsupported rerun keyword (first, last, every, skip).");
+  }
+  if (selection.first < 0 || selection.last < selection.first ||
+      selection.every < 0 || selection.skip <= 0) {
+    PRINT_INPUT_ERROR("invalid rerun selection arguments.");
+  }
+  bool uses_temperature_dependent_potential = false;
+  for (int i = 0; i < force.get_number_of_potentials(); ++i) {
+    if (force.get_potential(i).nep_model_type == 3) {
+      uses_temperature_dependent_potential = true;
+    }
+  }
+  if (uses_temperature_dependent_potential && !(simulation_temperature > 0.0)) {
+    PRINT_INPUT_ERROR(
+      "Temperature-dependent potential requires a positive temperature from "
+      "an existing GPUMD ensemble command before rerun.");
+  }
+  // An MD temperature ramp cannot be reproduced by one constant replay
+  // force-model temperature. Do not silently use only the first endpoint.
+  if (uses_temperature_dependent_potential && has_ensemble_for_rerun &&
+      integrate.get_temperature2() > 0.0 &&
+      std::abs(integrate.get_temperature1() - integrate.get_temperature2()) > 1.0e-10) {
+    PRINT_INPUT_ERROR(
+      "Temperature-dependent rerun currently requires a constant-temperature ensemble.");
+  }
+  measure.validate_rerun(has_potential_for_rerun_);
+  if (measure.rerun_output_conflicts(tokens[1])) {
+    PRINT_INPUT_ERROR("rerun dump_xyz output must not overwrite the input trajectory.");
+  }
+  const bool needs_velocity = measure.rerun_needs_velocity();
+  const double dt_fs = time_step * TIME_UNIT_CONVERSION;
+  // Match ordinary run: initialize Force from GPUMD's ensemble temperature,
+  // but never initialize or advance the integrator.
+  const double previous_force_temperature = force.get_temperature();
+  if (simulation_temperature > 0.0) {
+    force.set_temperature_range(simulation_temperature, simulation_temperature, 1);
+  }
+  const Box original_box = box;
+  const int N = atom.number_of_atoms;
+
+  // Keep the full working MD configuration intact for a following run/rerun.
+  std::vector<double> original_positions(3 * N);
+  std::vector<double> original_velocities(3 * N);
+  atom.position_per_atom.copy_to_host(original_positions.data());
+  atom.velocity_per_atom.copy_to_host(original_velocities.data());
+
+  std::vector<int> original_images(atom.position_image.size());
+  if (!original_images.empty()) atom.position_image.copy_to_host(original_images.data());
+  std::vector<double> original_unwrapped(atom.unwrapped_position.size());
+  if (!original_unwrapped.empty())
+    atom.unwrapped_position.copy_to_host(original_unwrapped.data());
+  std::vector<double> original_forces(atom.force_per_atom.size());
+  std::vector<double> original_potential(atom.potential_per_atom.size());
+  std::vector<double> original_virial(atom.virial_per_atom.size());
+  std::vector<double> original_mforce(atom.mforce_per_atom.size());
+  std::vector<double> original_thermo(thermo.size());
+  if (!original_forces.empty()) atom.force_per_atom.copy_to_host(original_forces.data());
+  if (!original_potential.empty()) atom.potential_per_atom.copy_to_host(original_potential.data());
+  if (!original_virial.empty()) atom.virial_per_atom.copy_to_host(original_virial.data());
+  if (!original_mforce.empty()) atom.mforce_per_atom.copy_to_host(original_mforce.data());
+  if (!original_thermo.empty()) thermo.copy_to_host(original_thermo.data());
+
+  // A separate thermodynamic calculator avoids requiring an MD ensemble.
+  Thermo thermo_calculator;
+  std::vector<double> zero_forces(3 * N, 0.0);
+  // The potential is mandatory, so energy/forces/virial are always recalculated.
+  std::vector<double> thermo_row(thermo.size(), 0.0);
+
+  long long processed = 0;
+  long long previous_step = std::numeric_limits<long long>::min();
+  try {
+    gpumd_rerun::Frame frame;
+    measure.pre_rerun(
+      time_step, simulation_temperature, integrate, group, atom, box, force, tokens[1]);
+    gpumd_rerun::Reader reader(tokens[1]);
+    while (reader.next(frame)) {
+      const long long step = gpumd_rerun::frame_step(frame, dt_fs);
+      // Skip duplicate or out-of-order timesteps in the input trajectory.
+      if (step <= previous_step) continue;
+      previous_step = step;
+      // Snapshots are expected in ascending order. Like LAMMPS, stop once
+      // the first snapshot beyond the requested last timestep is reached.
+      if (step > selection.last) break;
+      if (!selection.accepts(step)) continue;
+      if (frame.species.size() != static_cast<size_t>(N))
+        throw std::runtime_error("rerun atom count differs from model.xyz");
+      for (int i = 0; i < N; ++i) {
+        if (frame.species[i] != atom.cpu_atom_symbol[i])
+          throw std::runtime_error("rerun atom symbols/order differ from model.xyz");
+      }
+      if (needs_velocity && frame.velocities.empty())
+        throw std::runtime_error(
+          "rerun output requires vel:R:3 in every selected XYZ frame");
+      for (int i = 0; i < 9; ++i) box.cpu_h[i] = frame.lattice[i];
+      box.pbc_x = frame.pbc[0];
+      box.pbc_y = frame.pbc[1];
+      box.pbc_z = frame.pbc[2];
+      if (!(box.get_volume() > 1.0e-12))
+        throw std::runtime_error("rerun invalid simulation cell");
+      box.get_inverse();
+      box.set_is_orthogonal();
+
+      atom.position_per_atom.copy_from_host(frame.positions.data());
+      if (!frame.velocities.empty()) {
+        std::vector<double> velocity_natural = frame.velocities;
+        for (double& v : velocity_natural) v *= TIME_UNIT_CONVERSION;
+        atom.velocity_per_atom.copy_from_host(velocity_natural.data());
+      } else {
+        // No synthetic MD temperature: a missing velocity means zeroed velocity,
+        // and the thermo action above explicitly rejects such a frame.
+        atom.velocity_per_atom.copy_from_host(zero_forces.data());
+      }
+      if (!original_images.empty()) {
+        std::vector<int> zero_images(original_images.size(), 0);
+        atom.position_image.copy_from_host(zero_images.data());
+      }
+      atom.update_unwrapped_position(box);
+
+      // Recalculate physical forces for each snapshot without integration.
+      force.compute(box, atom, group);
+
+      if (!frame.velocities.empty()) {
+        thermo_calculator.compute(
+          N, box.get_volume(), atom.mass, atom.potential_per_atom,
+          atom.velocity_per_atom, atom.virial_per_atom, thermo);
+      } else {
+        std::fill(thermo_row.begin(), thermo_row.end(), 0.0);
+        // A potential energy can still be computed with no velocities.
+        // For position-only replay, use NaN rather than reporting false KE or stress.
+        if (frame.velocities.empty()) {
+          const double nan = std::numeric_limits<double>::quiet_NaN();
+          thermo_row[0] = nan; // temperature and kinetic energy are unknown
+          for (int j = 2; j < 8 && j < static_cast<int>(thermo_row.size()); ++j)
+            thermo_row[j] = nan; // do not report artificial stress from missing velocities
+        }
+        std::vector<double> per_atom_energy(N);
+        atom.potential_per_atom.copy_to_host(per_atom_energy.data());
+        if (thermo_row.size() > 1)
+          thermo_row[1] = std::accumulate(
+            per_atom_energy.begin(), per_atom_energy.end(), 0.0);
+        thermo.copy_from_host(thermo_row.data());
+      }
+
+      // Actual frame timestamp (internal natural time units), not the frame index.
+      measure.rerun_frame(
+        step, frame.time_fs / TIME_UNIT_CONVERSION,
+        integrate, group, atom, box, force, thermo);
+      ++processed;
+    }
+    measure.post_rerun(time_step, integrate, atom, box);
+  } catch (const std::exception& error) {
+    fprintf(stderr, "rerun failed: %s\n", error.what());
+    exit(EXIT_FAILURE);
+  }
+
+  box = original_box;
+  atom.position_per_atom.copy_from_host(original_positions.data());
+  atom.velocity_per_atom.copy_from_host(original_velocities.data());
+  if (!original_images.empty()) atom.position_image.copy_from_host(original_images.data());
+  if (!original_unwrapped.empty())
+    atom.unwrapped_position.copy_from_host(original_unwrapped.data());
+  if (!original_forces.empty()) atom.force_per_atom.copy_from_host(original_forces.data());
+  if (!original_potential.empty()) atom.potential_per_atom.copy_from_host(original_potential.data());
+  if (!original_virial.empty()) atom.virial_per_atom.copy_from_host(original_virial.data());
+  if (!original_mforce.empty()) atom.mforce_per_atom.copy_from_host(original_mforce.data());
+  if (!original_thermo.empty()) thermo.copy_from_host(original_thermo.data());
+
+  if (simulation_temperature > 0.0) {
+    force.set_temperature_range(previous_force_temperature, previous_force_temperature, 1);
+  }
+  // No MD integration occurred, so do not call the MD ensemble finalizer.
+  // Consume its configuration as a normal run would consume the ensemble.
+  if (has_ensemble_for_rerun) integrate.finalize_rerun();
+  printf("Rerun processed %lld frames without integration.\n", processed);
 }
 
 void Run::parse_velocity(const std::vector<std::string>& tokens)
@@ -494,6 +723,9 @@ void Run::parse_run(const std::vector<std::string>& tokens)
   }
   if (!integrate.has_ensemble()) {
     PRINT_INPUT_ERROR("An ensemble must be specified before each run.");
+  }
+  if (!has_potential_for_rerun_) {
+    PRINT_INPUT_ERROR("A potential must be specified before an MD run.");
   }
   printf("Run %d steps.\n", number_of_steps);
 

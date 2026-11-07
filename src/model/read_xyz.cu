@@ -514,9 +514,10 @@ void initialize_position(
     PRINT_INPUT_ERROR("Failed to open model.xyz.");
   }
 
-  std::vector<std::string> atom_symbols;
-  auto filename_potential = get_filename_potential(run_input);
-  atom_symbols = get_atom_symbols(filename_potential);
+  // Potential is required for both MD and rerun; preserve the standard
+  // potential-defined atom-type ordering and spin model initialization.
+  std::string filename_potential = get_filename_potential(run_input);
+  std::vector<std::string> atom_symbols = get_atom_symbols(filename_potential);
 
   read_xyz_line_1(input, atom.number_of_atoms);
   int property_offset[7] = {0, 0, 0, 0, 0, 0, 0};
